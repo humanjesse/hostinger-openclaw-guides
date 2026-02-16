@@ -502,3 +502,7 @@ The agent will see "Remind the customer about their 3pm appointment tomorrow" in
 - **`Permission denied` running call.py**: The script needs execute permission. Run `docker exec $CONTAINER_NAME chmod +x /data/.openclaw/workspace/skills/outbound-call/call.py`.
 - **Rate limits / billing concerns**: ElevenLabs bills outbound calls per minute of conversation. Check your plan limits at [elevenlabs.io/app/settings/billing](https://elevenlabs.io/app/settings/billing). Consider adding call rate limiting (see Production Hardening).
 - **Container name changed after redeployment**: Run `docker ps --filter "name=openclaw" --format '{{.Names}}'` to get the current name.
+
+## Next Steps
+
+After making outbound calls, you'll likely want to see what was said. The **[ElevenLabs Transcript Webhook](hostinger-openclaw-elevenlabs-transcript-webhook.md)** guide sets up automatic transcript delivery — when any call ends (inbound or outbound), the full transcript appears in the OpenClaw chat.
