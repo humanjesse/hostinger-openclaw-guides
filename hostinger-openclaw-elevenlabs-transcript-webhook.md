@@ -103,15 +103,28 @@ print('Hooks enabled.')
 docker restart $CONTAINER_NAME
 ```
 
-## Step 3: Generate a Webhook Secret
+## Step 3: Create the Webhook in ElevenLabs and Get the HMAC Secret
 
-Create a shared secret for authenticating incoming webhooks from ElevenLabs. This prevents unauthorized parties from injecting fake transcripts:
+ElevenLabs uses **HMAC-SHA256** to sign webhook payloads — there is no option for a simple shared secret. You must create the webhook in the dashboard first to receive the signing secret.
+
+1. Go to the [ElevenLabs dashboard](https://elevenlabs.io/app/agents)
+2. Navigate to **Webhooks** (under workspace or agent settings)
+3. Click **Create Webhook**:
+   - **URL:** `https://YOUR_HOSTNAME.hstgr.cloud/webhooks/elevenlabs/transcript` (replace `YOUR_HOSTNAME` with your actual VPS hostname, e.g. `srv1370452`)
+   - **Events:** Select **Post-call transcription**
+   - **Authentication:** HMAC (this is the only option)
+4. Click **Create** — ElevenLabs will generate and display an HMAC secret (starts with `wsec_`)
+5. **Copy the secret immediately** — you won't be able to see it again
+
+> **Note:** ElevenLabs offers three types of post-call webhooks: **Transcription** (full transcript + analysis), **Audio** (MP3 recording), and **Call initiation failure**. For this guide, select **Post-call transcription**.
+
+Save the secret in a shell variable for use in the next steps:
 
 ```bash
-WEBHOOK_SECRET=$(openssl rand -hex 32)
-echo "Webhook secret: $WEBHOOK_SECRET"
-echo "Save this value — you'll enter it in the ElevenLabs dashboard (Step 7)."
+WEBHOOK_SECRET="wsec_YOUR_SECRET_HERE"
 ```
+
+Then assign the webhook to your agent: open your agent's settings, find the **Post-call webhook** dropdown, and select the webhook you just created.
 
 ## Step 4: Create the Nginx Snippet
 
@@ -147,7 +160,7 @@ EOF
 chmod 600 /etc/elevenlabs-transcript-relay.env
 ```
 
-> **Important:** Verify the values expanded correctly: `cat /etc/elevenlabs-transcript-relay.env`. All three should have real values.
+> **Important:** Verify the values expanded correctly: `cat /etc/elevenlabs-transcript-relay.env`. All three should have real values — `WEBHOOK_SECRET` should start with `wsec_`.
 
 Create the relay script:
 
@@ -177,35 +190,68 @@ if not OPENCLAW_TOKEN:
 
 
 def verify_webhook(body, headers):
-    """Verify the webhook came from ElevenLabs using the shared secret."""
+    """Verify the webhook signature using ElevenLabs HMAC-SHA256."""
     if not WEBHOOK_SECRET:
         print("[transcript] WARNING: No WEBHOOK_SECRET set — skipping verification. "
               "This is INSECURE for production use.", flush=True)
         return True
 
-    # ElevenLabs sends the secret in a custom header
-    provided = headers.get("X-Webhook-Secret", "")
-    if not provided:
-        # Also check Authorization header as fallback
-        auth = headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            provided = auth[7:]
-
-    if not provided:
-        print("[transcript] No secret in request headers", flush=True)
+    sig_header = headers.get("ElevenLabs-Signature", "")
+    if not sig_header:
+        sig_header = headers.get("elevenlabs-signature", "")
+    if not sig_header:
+        print("[transcript] No ElevenLabs-Signature header found", flush=True)
         return False
 
-    return hmac.compare_digest(provided, WEBHOOK_SECRET)
+    # Parse header: format is "t=<timestamp>,v0=<signature>"
+    parts = {}
+    for item in sig_header.split(","):
+        if "=" in item:
+            key, val = item.split("=", 1)
+            parts[key.strip()] = val.strip()
+
+    timestamp = parts.get("t", "")
+    signature = parts.get("v0", "")
+
+    if not timestamp or not signature:
+        print(f"[transcript] Malformed signature header: {sig_header}", flush=True)
+        return False
+
+    # Compute expected: HMAC-SHA256(secret_without_prefix, "timestamp.body")
+    secret = WEBHOOK_SECRET
+    if secret.startswith("wsec_"):
+        secret = secret[5:]
+
+    signed_payload = f"{timestamp}.{body}".encode()
+    expected = hmac.new(
+        secret.encode(), signed_payload, hashlib.sha256
+    ).hexdigest()
+
+    if hmac.compare_digest(expected, signature):
+        return True
+
+    # Fallback: try with full secret including wsec_ prefix
+    expected_full = hmac.new(
+        WEBHOOK_SECRET.encode(), signed_payload, hashlib.sha256
+    ).hexdigest()
+
+    if hmac.compare_digest(expected_full, signature):
+        return True
+
+    print("[transcript] Signature mismatch", flush=True)
+    return False
 
 
 def format_transcript(payload):
     """Extract and format the transcript from the webhook payload."""
-    conversation_id = payload.get("conversation_id", "unknown")
-    agent_name = payload.get("agent_name", "Voice Agent")
-    status = payload.get("status", "unknown")
+    # ElevenLabs wraps data: {"type": "post_call_transcription", "data": {...}}
+    data = payload.get("data", payload)
+
+    conversation_id = data.get("conversation_id", "unknown")
+    status = data.get("status", "unknown")
 
     # Build transcript text from turn array
-    transcript = payload.get("transcript", [])
+    transcript = data.get("transcript", [])
     lines = []
     for turn in transcript:
         role = turn.get("role", "unknown").capitalize()
@@ -216,22 +262,32 @@ def format_transcript(payload):
     transcript_text = "\n".join(lines) if lines else "(no transcript available)"
 
     # Extract analysis if present
-    analysis = payload.get("analysis", {})
+    analysis = data.get("analysis", {})
     analysis_text = ""
     if analysis:
+        summary = analysis.get("transcript_summary", "")
+        if summary:
+            analysis_text += f"\nSummary: {summary}"
+        call_successful = analysis.get("call_successful", "")
+        if call_successful:
+            analysis_text += f"\nCall outcome: {call_successful}"
         eval_result = analysis.get("evaluation_criteria_results", {})
         data_results = analysis.get("data_collection_results", {})
         if eval_result:
-            analysis_text += f"\nAnalysis: {json.dumps(eval_result)}"
+            analysis_text += f"\nEvaluation: {json.dumps(eval_result)}"
         if data_results:
             analysis_text += f"\nCollected data: {json.dumps(data_results)}"
 
-    # Format the message for OpenClaw
-    summary = f"Call ended (conversation: {conversation_id}, status: {status})"
-    if analysis_text:
-        summary += analysis_text
+    # Extract metadata
+    metadata = data.get("metadata", {})
+    duration = metadata.get("call_duration_secs", "")
+    duration_text = f", duration: {duration}s" if duration else ""
 
-    return f"{summary}\n\nTranscript:\n{transcript_text}"
+    header = f"Call ended (conversation: {conversation_id}, status: {status}{duration_text})"
+    if analysis_text:
+        header += analysis_text
+
+    return f"{header}\n\nTranscript:\n{transcript_text}"
 
 
 class TranscriptHandler(BaseHTTPRequestHandler):
@@ -329,20 +385,7 @@ ss -tlnp | grep 8081
 # Should show python3 listening on 127.0.0.1:8081
 ```
 
-## Step 7: Configure the Webhook in ElevenLabs
-
-1. Go to the [ElevenLabs dashboard](https://elevenlabs.io/app/agents)
-2. Open your agent's settings
-3. Navigate to the **Webhooks** section (under Agent settings or workspace settings)
-4. Add a **Transcription webhook**:
-   - **URL:** `https://YOUR_HOSTNAME.hstgr.cloud/webhooks/elevenlabs/transcript`
-   - **Secret / Authentication header:** Enter the webhook secret from Step 3
-
-Replace `YOUR_HOSTNAME` with your actual VPS hostname (e.g., `srv1370452`).
-
-> **Note:** ElevenLabs offers three types of post-call webhooks: **Transcription** (full transcript + analysis), **Audio** (MP3 recording), and **Call initiation failure**. For this guide, configure the **Transcription** webhook.
-
-## Step 8: Test End-to-End
+## Step 7: Test End-to-End
 
 Watch the relay logs in one terminal:
 
@@ -363,7 +406,9 @@ When the call ends, you should see in the relay logs:
 And in the OpenClaw web UI, the agent should receive a message like:
 
 ```
-Call ended (conversation: conv_xxxx, status: done)
+Call ended (conversation: conv_xxxx, status: done, duration: 45s)
+Summary: The caller tested the transcript feature.
+Call outcome: success
 
 Transcript:
 Agent: Hello! How can I help you today?
@@ -378,7 +423,7 @@ Agent: Great, the transcript webhook is working!
 ## Security Layers
 
 1. **SSL/TLS** — Let's Encrypt via certbot
-2. **Webhook secret verification** — Shared secret in request headers; rejects unauthorized senders
+2. **HMAC-SHA256 signature verification** — ElevenLabs signs each payload with a shared secret; the relay verifies the `ElevenLabs-Signature` header before processing
 3. **Nginx rate limiting** — 2 req/s per IP with burst of 10 via `hook_limit` zone
 4. **Nginx path restriction** — Only registered integration paths are proxied; everything else returns 404
 5. **Payload size limit** — `client_max_body_size 2m` rejects oversized requests at the edge
@@ -398,11 +443,11 @@ For commercial or high-risk deployments, also consider:
 
 ## Troubleshooting
 
-- **Webhook not firing after call ends**: Verify the webhook URL is correct in the ElevenLabs dashboard. Check that you configured a **Transcription** webhook (not Audio or Failure). There may be a 10–30 second delay while ElevenLabs processes the transcript.
+- **Webhook not firing after call ends**: Verify the webhook URL is correct in the ElevenLabs dashboard. Check that you selected **Post-call transcription** (not Audio or Failure). Ensure the webhook is assigned to your agent in the agent's post-call webhook setting. There may be a 10–30 second delay while ElevenLabs processes the transcript.
 - **Relay not receiving requests**: Check `systemctl status elevenlabs-transcript-relay` and `ss -tlnp | grep 8081`. Verify the nginx snippet loaded: `nginx -t && systemctl reload nginx`. Check `curl -sS http://127.0.0.1:8081/webhooks/elevenlabs/transcript -X POST -d '{}'` returns a response (even if 401).
-- **401 from relay**: The webhook secret doesn't match. Verify the secret in `/etc/elevenlabs-transcript-relay.env` matches what you entered in the ElevenLabs dashboard.
+- **401 from relay (signature mismatch)**: The HMAC secret doesn't match. Verify the `WEBHOOK_SECRET` in `/etc/elevenlabs-transcript-relay.env` is the exact `wsec_...` value ElevenLabs gave you in Step 3. If you lost the secret, delete the webhook in the ElevenLabs dashboard and create a new one to get a fresh secret. After updating the env file, restart the relay: `systemctl restart elevenlabs-transcript-relay`.
 - **Transcript shows "(no transcript available)"**: The call may still be in `processing` status. The webhook should only fire after processing completes, but if it fires early the transcript array may be empty.
-- **OpenClaw doesn't show the transcript**: Check that hooks are enabled in `openclaw.json` and the `OPENCLAW_TOKEN` in the env file matches the token in the config. Check relay logs for `OpenClaw: {"ok":true}`.
+- **OpenClaw doesn't show the transcript**: Check that hooks are enabled in `openclaw.json` and the `OPENCLAW_TOKEN` in the env file matches the token in the config. Check relay logs for `OpenClaw: {"ok":true}`. The transcript may take a moment to appear — try refreshing the web UI. Note that the transcript is delivered via `/hooks/wake`, which wakes whichever session is currently active — it may land in the heartbeat session rather than the chat you're looking at. Check recent messages across sessions.
 - **Relay exits with FATAL error**: `OPENCLAW_TOKEN` or `OPENCLAW_CONTAINER` not set in `/etc/elevenlabs-transcript-relay.env`. Verify with `cat /etc/elevenlabs-transcript-relay.env`.
 - **Nginx won't reload after adding snippet**: Check `nginx -t` output. A syntax error in any `.conf` file under `openclaw.d/` blocks the entire config.
 - **Other integrations broke**: Ensure you didn't overwrite `/etc/nginx/sites-available/openclaw` — each guide only touches its own snippet file.
