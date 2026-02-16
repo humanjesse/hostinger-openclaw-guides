@@ -6,7 +6,7 @@ Setup guides for connecting external services to [OpenClaw](https://github.com/o
 
 - **[AgentMail Webhook Setup](hostinger-openclaw-agentmail-setup.md)** — Receive emails via AgentMail webhooks and relay them to OpenClaw
 - **[ElevenLabs Voice Agent Setup](hostinger-openclaw-elevenlabs-setup.md)** — Connect ElevenLabs voice agents (phone, web widget, WhatsApp) to OpenClaw as the LLM backend
-- **[ElevenLabs Outbound Call Skill](hostinger-openclaw-outbound-call-skill.md)** — Build an OpenClaw skill that initiates outbound phone calls via ElevenLabs + Twilio
+- **[ElevenLabs Outbound Call Skill](hostinger-openclaw-outbound-call-skill.md)** — Build an OpenClaw skill that initiates outbound phone calls via ElevenLabs + Twilio ([ClawHub](https://clawhub.ai/humanjesse/outbound-call))
 
 ## Architecture
 

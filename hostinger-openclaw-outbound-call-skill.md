@@ -31,6 +31,16 @@ Voice agent uses OpenClaw as LLM backend (same as inbound)
 
 **The outbound call uses the exact same agent configuration as inbound calls** — same voice, same Custom LLM (your OpenClaw endpoint), same prompt, same tools, same knowledge base. You can optionally override the first message or pass dynamic variables per call.
 
+## Quick Install via ClawHub
+
+This skill is published on ClawHub at [clawhub.ai/humanjesse/outbound-call](https://clawhub.ai/humanjesse/outbound-call). If you'd rather skip the manual setup (Steps 4–6), install it directly:
+
+```bash
+docker exec -it $CONTAINER_NAME clawdhub install humanjesse/outbound-call
+```
+
+Then jump to **Step 7** to add your environment variables. The rest of this guide walks through building the skill from scratch, which is useful if you want to understand how it works or customize it.
+
 ---
 
 ## Step 1: Identify Your Container and Config Paths
