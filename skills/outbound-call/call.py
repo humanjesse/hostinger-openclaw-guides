@@ -59,6 +59,9 @@ def make_call(to_number: str, first_message: str = "", context: str = "") -> dic
     try:
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read())
+            # ElevenLabs may return HTTP 200 with an error in the body
+            if not result.get("success", True) or "error" in result:
+                return {"error": result.get("error", result.get("message", "Unknown API error"))}
             return {
                 "success": True,
                 "conversation_id": result.get("conversation_id", ""),

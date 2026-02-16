@@ -159,7 +159,7 @@ Your phone should ring within a few seconds. The voice agent on the call will us
 ## Step 4: Create the Skill Directory
 
 ```bash
-SKILL_DIR="$DEPLOY_DIR/data/.openclaw/skills/outbound-call"
+SKILL_DIR="$DEPLOY_DIR/data/.openclaw/workspace/skills/outbound-call"
 
 if [ -d "$SKILL_DIR" ]; then
     echo "Skill directory already exists — skipping."
@@ -174,7 +174,7 @@ ls -la "$SKILL_DIR"
 Check what other skills are already installed for reference:
 
 ```bash
-docker exec $CONTAINER_NAME ls /data/.openclaw/skills/ 2>/dev/null || echo "No skills installed yet"
+docker exec $CONTAINER_NAME ls /data/.openclaw/workspace/skills/ 2>/dev/null || echo "No skills installed yet"
 ```
 
 ## Step 5: Write the Call Script
@@ -244,6 +244,9 @@ def make_call(to_number: str, first_message: str = "", context: str = "") -> dic
     try:
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read())
+            # ElevenLabs may return HTTP 200 with an error in the body
+            if not result.get("success", True) or "error" in result:
+                return {"error": result.get("error", result.get("message", "Unknown API error"))}
             return {
                 "success": True,
                 "conversation_id": result.get("conversation_id", ""),
@@ -390,18 +393,16 @@ You should see three lines with actual values (not empty strings). If any are bl
 nano "$DEPLOY_DIR/.env"
 ```
 
-## Step 8: Enable Overrides in ElevenLabs (Optional)
+## Step 8: Enable First Message Override in ElevenLabs
 
-If you want the skill to pass a custom first message per call (the `first_message` argument in `call.py`), you must enable the override in ElevenLabs:
+Enable the first message override so OpenClaw can pass a custom greeting when initiating outbound calls:
 
 1. Go to your agent in the [ElevenLabs dashboard](https://elevenlabs.io/app/agents)
 2. Navigate to the **Security** tab
 3. Enable the **First message** override toggle
 4. Optionally enable **System prompt** override if you want per-call prompt customization
 
-Without this, the `conversation_config_override` in the API payload is silently ignored and the agent uses its default first message for all outbound calls.
-
-> **Note:** If you only need a static greeting, skip this step. The default first message configured in your agent settings will be used.
+> **Important:** Without this, outbound calls will **immediately hang up** if OpenClaw passes a custom first message. ElevenLabs rejects the override and drops the call. This is the most common issue when first testing the skill.
 
 ## Step 9: Restart and Test
 
@@ -417,7 +418,7 @@ sleep 5
 Verify the skill files are visible inside the container:
 
 ```bash
-docker exec $CONTAINER_NAME ls /data/.openclaw/skills/outbound-call/
+docker exec $CONTAINER_NAME ls /data/.openclaw/workspace/skills/outbound-call/
 ```
 
 Test the call script directly from inside the container to confirm environment variables are loaded:
@@ -425,7 +426,7 @@ Test the call script directly from inside the container to confirm environment v
 ```bash
 # Dry run — check that env vars are set (this will fail with a validation error since
 # the number is fake, but it confirms the script loads and env vars are available)
-docker exec $CONTAINER_NAME python3 /data/.openclaw/skills/outbound-call/call.py +10000000000
+docker exec $CONTAINER_NAME python3 /data/.openclaw/workspace/skills/outbound-call/call.py +10000000000
 ```
 
 You should see an error about the API call failing (invalid number), not about missing environment variables. If you see `ELEVENLABS_API_KEY not set`, the `.env` file isn't being loaded — verify the `env_file` directive in `docker-compose.yml`.
@@ -433,7 +434,7 @@ You should see an error about the API call failing (invalid number), not about m
 Now test with a real number you control:
 
 ```bash
-docker exec $CONTAINER_NAME python3 /data/.openclaw/skills/outbound-call/call.py +1XXXXXXXXXX
+docker exec $CONTAINER_NAME python3 /data/.openclaw/workspace/skills/outbound-call/call.py +1XXXXXXXXXX
 ```
 
 Replace `+1XXXXXXXXXX` with your actual phone number. Your phone should ring within seconds.
@@ -497,7 +498,7 @@ The agent will see "Remind the customer about their 3pm appointment tomorrow" in
 - **HTTP 401 from ElevenLabs**: API key is invalid or expired. Generate a new one at [elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys).
 - **Call connects but agent uses default greeting**: You need to enable the "First message" override in your agent's Security tab (Step 8). Without it, the `first_message` parameter is silently ignored.
 - **Phone rings but no voice / silence**: The ElevenLabs agent can't reach your OpenClaw endpoint. Verify `curl -sS https://YOUR_HOSTNAME.hstgr.cloud/v1/chat/completions` still works with the gateway token.
-- **Skill not recognized by OpenClaw**: The agent doesn't use `call.py` when you ask it to make a call. Verify the SKILL.md exists at the correct path: `docker exec $CONTAINER_NAME cat /data/.openclaw/skills/outbound-call/SKILL.md`. Restart the container after adding the skill.
-- **`Permission denied` running call.py**: The script needs execute permission. Run `docker exec $CONTAINER_NAME chmod +x /data/.openclaw/skills/outbound-call/call.py`.
+- **Skill not recognized by OpenClaw**: The agent doesn't use `call.py` when you ask it to make a call. Verify the SKILL.md exists at the correct path: `docker exec $CONTAINER_NAME cat /data/.openclaw/workspace/skills/outbound-call/SKILL.md`. Restart the container after adding the skill.
+- **`Permission denied` running call.py**: The script needs execute permission. Run `docker exec $CONTAINER_NAME chmod +x /data/.openclaw/workspace/skills/outbound-call/call.py`.
 - **Rate limits / billing concerns**: ElevenLabs bills outbound calls per minute of conversation. Check your plan limits at [elevenlabs.io/app/settings/billing](https://elevenlabs.io/app/settings/billing). Consider adding call rate limiting (see Production Hardening).
 - **Container name changed after redeployment**: Run `docker ps --filter "name=openclaw" --format '{{.Names}}'` to get the current name.
