@@ -13,6 +13,8 @@ metadata:
 
 # Outbound Call
 
+> **Source code and setup guide:** [github.com/humanjesse/hostinger-openclaw-guides](https://github.com/humanjesse/hostinger-openclaw-guides)
+
 Place outbound phone calls using the ElevenLabs voice agent with Twilio. The voice agent on the call uses OpenClaw as its brain — same as inbound calls.
 
 ## When to use
