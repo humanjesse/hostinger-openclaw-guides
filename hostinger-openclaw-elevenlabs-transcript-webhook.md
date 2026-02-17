@@ -8,7 +8,7 @@
 
 ## Key Architecture Notes
 
-When an ElevenLabs voice call ends (inbound or outbound), ElevenLabs can fire a **post-call webhook** containing the full conversation transcript, call metadata, and optional analysis results. This guide sets up a relay that catches those webhooks and delivers the transcript into the OpenClaw chat via `/hooks/wake` — the same pattern used by the [AgentMail webhook guide](hostinger-openclaw-agentmail-setup.md).
+When an ElevenLabs voice call ends (inbound or outbound), ElevenLabs can fire a **post-call webhook** containing the full conversation transcript, call metadata, and optional analysis results. This guide sets up a relay that catches those webhooks and delivers the transcript into OpenClaw via `/hooks/agent` — each call gets its own isolated session (keyed by conversation ID), and a summary is automatically surfaced in the main session via heartbeat.
 
 ```
 Call ends (inbound or outbound)
@@ -22,9 +22,9 @@ nginx (TLS + rate limit)
        ↓
 docker exec → curl inside container
        ↓
-127.0.0.1:18789 /hooks/wake (OpenClaw Gateway, token auth)
+127.0.0.1:18789 /hooks/agent (OpenClaw Gateway, token auth)
        ↓
-OpenClaw chat: "Call ended. Transcript: ..."
+Isolated session per call + summary in main session
 ```
 
 This works for **both inbound and outbound calls** — any call handled by your ElevenLabs agent will have its transcript delivered to OpenClaw automatically.
@@ -51,7 +51,7 @@ hostname -f
 
 ## Step 2: Ensure Hooks Are Enabled in OpenClaw
 
-The transcript relay delivers data via OpenClaw's `/hooks/wake` endpoint, which must be enabled with token authentication. If you've already followed the [AgentMail guide](hostinger-openclaw-agentmail-setup.md), hooks are already enabled — check and reuse the existing token:
+The transcript relay delivers data via OpenClaw's `/hooks/agent` endpoint, which must be enabled with token authentication and the `allowRequestSessionKey` setting. If you've already followed the [AgentMail guide](hostinger-openclaw-agentmail-setup.md), hooks are already enabled — check and reuse the existing token:
 
 ```bash
 # Check if hooks are already configured
@@ -67,7 +67,7 @@ else:
 "
 ```
 
-If hooks are already enabled, retrieve the existing token:
+If hooks are already enabled, retrieve the existing token and ensure `allowRequestSessionKey` is set:
 
 ```bash
 # Get the token from the config
@@ -77,6 +77,21 @@ with open('/data/.openclaw/openclaw.json', 'r') as f:
     print(json.load(f).get('hooks', {}).get('token', ''))
 ")
 echo "Hook token: ${HOOK_TOKEN:0:8}..."
+
+# Enable allowRequestSessionKey (required for /hooks/agent with custom session keys)
+docker exec $CONTAINER_NAME python3 -c "
+import json
+config_path = '/data/.openclaw/openclaw.json'
+with open(config_path, 'r') as f:
+    config = json.load(f)
+if not config.get('hooks', {}).get('allowRequestSessionKey'):
+    config['hooks']['allowRequestSessionKey'] = True
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print('allowRequestSessionKey enabled — restart container.')
+else:
+    print('allowRequestSessionKey already enabled.')
+"
 ```
 
 If hooks are **not** enabled, set them up now:
@@ -95,6 +110,7 @@ config.setdefault('hooks', {})
 config['hooks']['enabled'] = True
 config['hooks']['path'] = '/hooks'
 config['hooks']['token'] = '$HOOK_TOKEN'
+config['hooks']['allowRequestSessionKey'] = True
 with open(config_path, 'w') as f:
     json.dump(config, f, indent=2)
 print('Hooks enabled.')
@@ -167,7 +183,7 @@ Create the relay script:
 ```bash
 cat > /usr/local/bin/elevenlabs-transcript-relay.py << 'PYEOF'
 #!/usr/bin/env python3
-"""Relay ElevenLabs post-call transcript webhooks to OpenClaw."""
+"""Relay ElevenLabs post-call transcript webhooks to OpenClaw via /hooks/agent."""
 import hmac
 import hashlib
 import json
@@ -287,7 +303,7 @@ def format_transcript(payload):
     if analysis_text:
         header += analysis_text
 
-    return f"{header}\n\nTranscript:\n{transcript_text}"
+    return conversation_id, f"{header}\n\nTranscript:\n{transcript_text}"
 
 
 class TranscriptHandler(BaseHTTPRequestHandler):
@@ -310,21 +326,23 @@ class TranscriptHandler(BaseHTTPRequestHandler):
 
         try:
             payload = json.loads(body_str)
-            openclaw_text = format_transcript(payload)
+            conversation_id, openclaw_text = format_transcript(payload)
         except Exception as e:
             print(f"[transcript] Parse error: {e}", flush=True)
+            conversation_id = "unknown"
             openclaw_text = f"Call transcript webhook received (parse error): {body_str[:500]}"
 
+        # Use /hooks/agent with a stable sessionKey per conversation
         openclaw_payload = json.dumps({
-            "text": openclaw_text,
+            "message": openclaw_text,
             "name": "ElevenLabs",
-            "mode": "now"
+            "sessionKey": f"hook:elevenlabs:{conversation_id}",
+            "wakeMode": "now"
         })
 
-        # Bypass Express proxy — curl directly inside the container
         result = subprocess.run([
             'docker', 'exec', OPENCLAW_CONTAINER,
-            'curl', '-s', '-X', 'POST', 'http://127.0.0.1:18789/hooks/wake',
+            'curl', '-s', '-X', 'POST', 'http://127.0.0.1:18789/hooks/agent',
             '-H', f'Authorization: Bearer {OPENCLAW_TOKEN}',
             '-H', 'Content-Type: application/json',
             '-d', openclaw_payload
@@ -344,6 +362,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
 
 
 print("[transcript] ElevenLabs transcript relay listening on 127.0.0.1:8081", flush=True)
+print("[transcript] Using /hooks/agent for isolated session + main session summary", flush=True)
 if not WEBHOOK_SECRET:
     print("[transcript] WARNING: Running without webhook verification!", flush=True)
 HTTPServer(('127.0.0.1', 8081), TranscriptHandler).serve_forever()
@@ -400,10 +419,10 @@ When the call ends, you should see in the relay logs:
 ```
 [transcript] Received POST /webhooks/elevenlabs/transcript, body length: XXXX
 [transcript] Webhook verified OK
-[transcript] OpenClaw: {"ok":true,"mode":"now"}
+[transcript] OpenClaw: {"ok":true}
 ```
 
-And in the OpenClaw web UI, the agent should receive a message like:
+The transcript is delivered to an isolated session keyed by the conversation ID. The main session will receive a summary automatically via heartbeat. In the OpenClaw web UI, you should see a message like:
 
 ```
 Call ended (conversation: conv_xxxx, status: done, duration: 45s)
@@ -447,7 +466,8 @@ For commercial or high-risk deployments, also consider:
 - **Relay not receiving requests**: Check `systemctl status elevenlabs-transcript-relay` and `ss -tlnp | grep 8081`. Verify the nginx snippet loaded: `nginx -t && systemctl reload nginx`. Check `curl -sS http://127.0.0.1:8081/webhooks/elevenlabs/transcript -X POST -d '{}'` returns a response (even if 401).
 - **401 from relay (signature mismatch)**: The HMAC secret doesn't match. Verify the `WEBHOOK_SECRET` in `/etc/elevenlabs-transcript-relay.env` is the exact `wsec_...` value ElevenLabs gave you in Step 3. If you lost the secret, delete the webhook in the ElevenLabs dashboard and create a new one to get a fresh secret. After updating the env file, restart the relay: `systemctl restart elevenlabs-transcript-relay`.
 - **Transcript shows "(no transcript available)"**: The call may still be in `processing` status. The webhook should only fire after processing completes, but if it fires early the transcript array may be empty.
-- **OpenClaw doesn't show the transcript**: Check that hooks are enabled in `openclaw.json` and the `OPENCLAW_TOKEN` in the env file matches the token in the config. Check relay logs for `OpenClaw: {"ok":true}`. The transcript may take a moment to appear — try refreshing the web UI. Note that the transcript is delivered via `/hooks/wake`, which wakes whichever session is currently active — it may land in the heartbeat session rather than the chat you're looking at. Check recent messages across sessions.
+- **OpenClaw doesn't show the transcript**: Check that hooks are enabled in `openclaw.json` and the `OPENCLAW_TOKEN` in the env file matches the token in the config. Check relay logs for `OpenClaw: {"ok":true}`. The transcript is delivered to an isolated session via `/hooks/agent` — the main session receives a summary automatically via heartbeat, which may take a moment to appear. Try refreshing the web UI.
+- **"sessionKey is disabled" error in relay logs**: Set `hooks.allowRequestSessionKey = true` in `openclaw.json` and restart the container. See Step 2 for the exact command.
 - **Relay exits with FATAL error**: `OPENCLAW_TOKEN` or `OPENCLAW_CONTAINER` not set in `/etc/elevenlabs-transcript-relay.env`. Verify with `cat /etc/elevenlabs-transcript-relay.env`.
 - **Nginx won't reload after adding snippet**: Check `nginx -t` output. A syntax error in any `.conf` file under `openclaw.d/` blocks the entire config.
 - **Other integrations broke**: Ensure you didn't overwrite `/etc/nginx/sites-available/openclaw` — each guide only touches its own snippet file.
